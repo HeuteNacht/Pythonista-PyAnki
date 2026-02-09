@@ -1,15 +1,10 @@
-#PyAnki ver5:utils.py
-#增加编辑删除卡片功能
-#这里存放独立的辅助函数,它们不需要知道“卡片”是什么,只需要处理输入输出
-
+# PyAnki ver5:utils.py#修复无法读长文章和闪退的问题
 import speech
-#支持简体中文转繁体中文
 import opencc
-# 支持文件系统
 import os
 import config
+import ui
 
-# --- 离线转换器核心逻辑 ---
 class PureOfflineConverter:
     def __init__(self, dict_dir):
         self.mapping = {}
@@ -17,7 +12,6 @@ class PureOfflineConverter:
         self._load_dicts(dict_dir)
 
     def _load_dicts(self, dict_dir):
-        # 常见字典文件名列表
         files = ['STCharacters.txt', 'STPhrases.txt']
         for f_name in files:
             path = os.path.join(dict_dir, f_name)
@@ -36,86 +30,88 @@ class PureOfflineConverter:
         i = 0
         while i < len(text):
             match = None
-            for length in range(self.max_len, 0, -1):
-                sub = text[i : i + length]
+            for length in range(min(self.max_len, len(text) - i), 0, -1):
+                sub = text[i:i+length]
                 if sub in self.mapping:
-                    match = self.mapping[sub]
-                    result.append(match)
-                    i += length
+                    match = (sub, self.mapping[sub])
                     break
-            if not match:
+            if match:
+                result.append(match[1])
+                i += len(match[0])
+            else:
                 result.append(text[i])
                 i += 1
         return "".join(result)
 
-# --- 智能转换逻辑 ---
-_online_cc = None
 _offline_cc = None
 
 def convert_chinese_smart(text, mode='s2t'):
-    """智能转换:优先 OpenCC,失败则转离线"""
-    global _online_cc, _offline_cc
-    
-    # 1. 尝试使用 OpenCC (在线/原生)
+    global _offline_cc
+    if not text: return ""
     try:
-        if _online_cc is None:
-            # 这里的尝试可能会因为没有字典或网络环境而失败
-            _online_cc = opencc.OpenCC(mode)
-        return _online_cc.convert(text)
-    
+        cc = opencc.OpenCC(mode)
+        return cc.convert(text)
     except Exception as e:
-        # 2. 如果失败,进入离线降级模式
         if _offline_cc is None:
             dict_path = config.OFFLINE_DICT_DIR
             if os.path.exists(dict_path):
                 _offline_cc = PureOfflineConverter(dict_path)
             else:
                 return f"转换失败:OpenCC不可用且未发现离线字典 {dict_path}"
-        
-        # 离线转换不需要 mode 参数(通常默认 s2t)
         return "[离线] " + _offline_cc.convert(text)
 
-'''
-# 全局缓存转换器实例,避免重复加载字典提高性能
-_converter_cache = {}
-
-def convert_chinese(text, mode='s2t'):
-    """
-    通用中文转换工具
-    :param text: 需要转换的文本
-    :param mode: 转换模式
-        's2t': 简体 -> 繁体 (默认)
-        's2twp': 简体 -> 台湾繁体 (带词汇修正)
-        't2s': 繁体 -> 简体
-    """
-    global _converter_cache
-    
-    # 如果缓存中没有该模式的转换器,则初始化一个
-    if mode not in _converter_cache:
-        _converter_cache[mode] = opencc.OpenCC(mode)
-    
-    return _converter_cache[mode].convert(text)
-'''
-
 def is_contains_chinese(string):
-    """判断字符串是否包含中文"""
+    if not string: return False
     for char in string:
         if '\u4e00' <= char <= '\u9fa5':
             return True
     return False
 
-def speak_text(text, lang_pref='auto', default_chinese='zh-CN'):
-    """TTS 发音逻辑 (修正版)"""
-    lang_code = 'en-US'
+def speak_text(text, lang_pref='auto', default_chinese='zh-HK'):
+    """TTS 发音逻辑 (原生队列版：读完所有长文且不闪退)"""
+    import speech
+    import time
+
+    if not text:
+        return
     
-    if lang_pref != 'auto':
+    # 1. 环境准备
+    lang_code = 'en-US'
+    if lang_pref and lang_pref != 'auto':
         lang_code = lang_pref
     elif is_contains_chinese(text):
         lang_code = default_chinese
         
+    # 2. 物理重置：先停掉之前的，给硬件 0.1s 反应时间
     speech.stop()
-    # 修正:直接传递 0.4 作为第三个参数,不使用 rate=
+    time.sleep(0.1)
+
+    # 3. 智能切割：将长文切成 400 字左右的小块（这是繁体字最安全的缓冲区长度）
+    # 我们按“句号”切割，确保语意连贯
+    def get_safe_chunks(raw_text, limit=400):
+        # 统一标点符号
+        temp_text = raw_text.replace('。', '。|').replace('.', '.|').replace('\n', ' |')
+        parts = temp_text.split('|')
+        
+        chunks = []
+        current_chunk = ""
+        for p in parts:
+            if len(current_chunk) + len(p) < limit:
+                current_chunk += p
+            else:
+                if current_chunk: chunks.append(current_chunk)
+                current_chunk = p
+        if current_chunk: chunks.append(current_chunk)
+        return chunks
+
+    chunks = get_safe_chunks(text)
+
+    # 4. 一次性注入原生队列
+    # iOS 会自动管理：读完 chunks[0]，接着读 chunks[1]，以此类推
+    # 这种方式不会闪退，因为每一块都在 iOS 的内存容错范围内
     try:
-        speech.say(text, lang_code, 0.4)
-    except:
-        speech.say(text, lang_code)
+        for chunk in chunks:
+            if chunk.strip():
+                speech.say(chunk, lang_code, 0.45)
+    except Exception as e:
+        print(f"TTS Queue Error: {e}")
